@@ -13,6 +13,9 @@ In this lab, you will have a first try on Edge AI by serving the LLM, TTS, and A
 
 First, you need to set up the environment by following the instructions in the [Environment Setup](./Environment.md) file. With the `qwen3` environment created and activated, you can continue the following steps.
 
+git clone https://github.com/stzhang-patrick/IEMS5709-25R2-Edge-Computing.git
+cd IEMS5709-25R2-Edge-Computing/Lab1
+
 ## Model Download
 
 Download the models to local directory by running the following commands:
@@ -22,14 +25,14 @@ conda activate qwen3
 pip install -U huggingface_hub
 python download_model.py
 ```
+
 Two models will be downloaded to the local directory `Qwen3-ASR-0.6B`, `Qwen3-TTS-12Hz-0.6B-Base` and `Qwen3-4B-quantized.w4a16` under `Lab1` directory.
 
 ## LLM Serving
 
 ```
-cd Lab1
 
-docker run \
+sudo docker run \
   --rm -it \
   --network host \
   --shm-size=8g \
