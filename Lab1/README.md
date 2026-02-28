@@ -13,8 +13,10 @@ In this lab, you will have a first try on Edge AI by serving the LLM, TTS, and A
 
 First, you need to set up the environment by following the instructions in the [Environment Setup](./Environment.md) file. With the `qwen3` environment created and activated, you can continue the following steps.
 
+```
 git clone https://github.com/stzhang-patrick/IEMS5709-25R2-Edge-Computing.git
 cd IEMS5709-25R2-Edge-Computing/Lab1
+```
 
 ## Model Download
 
