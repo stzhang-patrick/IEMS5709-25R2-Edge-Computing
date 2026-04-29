@@ -621,6 +621,102 @@ kubectl delete pod gpu-test
 
 ---
 
+## Part 4: Loading Images into K3s (Required for the Assignment)
+
+> **Read this before applying the assignment YAMLs**, otherwise your pods will sit in `ImagePullBackOff` forever.
+
+### 4.1 Why this is necessary
+
+K3s ships its **own** containerd, separate from the system Docker daemon. They use different image stores and namespaces:
+
+| Tool | Image store | Namespace |
+|---|---|---|
+| `docker` | `/var/lib/docker/` | `moby` |
+| K3s (`crictl`, `kubectl`) | `/var/lib/rancher/k3s/agent/containerd/` | `k8s.io` |
+
+So an image you can see with `docker images` is **invisible** to K3s. You must move it across explicitly.
+
+### 4.2 Assignment images and where they come from
+
+The four assignment services use these images:
+
+| Service | Image | Source | How to load |
+|---|---|---|---|
+| `vllm` | `ghcr.io/nvidia-ai-iot/vllm:latest-jetson-orin` | Public (ghcr.io, ~9 GB) | `crictl pull` |
+| `asr` | `faster-whisper:fastapi` | **Built locally in Lab 2** | `docker save` → `ctr import` |
+| `tts` | `dustynv/kokoro-tts:fastapi-r36.4.0-cu128-24.04` | Public (Docker Hub, ~5 GB) | `crictl pull` |
+| `open-webui` | `ghcr.io/open-webui/open-webui:main` | Public (ghcr.io, ~1 GB) | `crictl pull` |
+
+### 4.3 Pulling the public images directly into K3s
+
+K3s normally pulls public images on first use, but doing it ahead of time lets you see download progress and catch network errors:
+
+```bash
+sudo k3s crictl pull ghcr.io/nvidia-ai-iot/vllm:latest-jetson-orin
+sudo k3s crictl pull docker.io/dustynv/kokoro-tts:fastapi-r36.4.0-cu128-24.04
+sudo k3s crictl pull ghcr.io/open-webui/open-webui:main
+```
+
+### 4.4 Importing your Lab 2 image (`faster-whisper:fastapi`)
+
+Your Lab 2 ASR container exists only in Docker. Move it to K3s:
+
+```bash
+# 1. Confirm Docker has it
+docker images | grep faster-whisper
+# faster-whisper   fastapi   ...   11GB
+
+# 2. Save it to a tarball
+docker save faster-whisper:fastapi -o /tmp/fw.tar     # ~3-5 min on Jetson
+
+# 3. Import it into K3s's containerd, k8s.io namespace
+sudo ctr -n k8s.io images import /tmp/fw.tar          # ~2-3 min unpack
+rm /tmp/fw.tar
+
+# 4. Verify K3s can see it
+sudo k3s crictl images | grep faster-whisper
+```
+
+> If you forgot to do Lab 2 or your `faster-whisper:fastapi` image was wiped, you need to (re)build it from `Lab2/faster-whisper/` first.
+
+### 4.5 Common error: `ImagePullBackOff` after `kubectl apply`
+
+```bash
+$ kubectl get pod
+NAME                  READY   STATUS             RESTARTS   AGE
+asr-xxxx-yyyy         0/1     ImagePullBackOff   0          2m
+```
+
+```bash
+$ kubectl describe pod asr-xxxx-yyyy
+...
+Events:
+  Warning  Failed  ...  Failed to pull image "faster-whisper:fastapi": ...
+                       pull access denied, repository does not exist or may
+                       require authorization
+```
+
+This message is misleading. It does **not** mean a permissions issue — it means K3s tried to pull `faster-whisper:fastapi` from `docker.io` and didn't find it. The fix is §4.4 above.
+
+After importing, force the deployment to re-pull:
+
+```bash
+sudo kubectl rollout restart deployment asr
+sudo kubectl get pod -l app=asr -w
+```
+
+Setting `imagePullPolicy: IfNotPresent` in your YAML also helps — it tells K3s to skip the registry pull if the image is already in containerd.
+
+### 4.6 Quick sanity check before applying the assignment
+
+```bash
+sudo k3s crictl images | grep -E 'vllm|kokoro|faster-whisper|open-webui'
+```
+
+You should see all four. If anything is missing, fix it before `kubectl apply`.
+
+---
+
 ## Reference: Docker Compose → K3s Conversion
 
 | Docker Compose concept | K3s / Kubernetes equivalent |
