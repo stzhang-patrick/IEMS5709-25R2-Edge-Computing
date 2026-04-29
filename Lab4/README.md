@@ -36,6 +36,36 @@ K3s is a lightweight, production-grade Kubernetes distribution from Rancher (SUS
 
 ### 1.1 Install K3s
 
+> ⚠️ **DO NOT re-run the install command if K3s is already working on your machine.** The `curl ... | sh -` line below is also a *re-installer*: running it on a host that already has K3s will silently `k3s-uninstall.sh` first and then re-install from scratch — wiping your kubeconfig, all Deployments, all DaemonSets (including `nvidia-device-plugin-daemonset`), and any Lab 4 manifests you have already applied. This is a **common cause of "my GPU pods are suddenly all `Pending`"** on shared Jetsons. Always run the **Step 0 check below first**.
+
+#### Step 0: is K3s already installed and healthy?
+
+The TA team may have already configured K3s + the NVIDIA device plugin on your assigned Jetson. Before reinstalling, verify the current state:
+
+```bash
+# (a) Is the K3s service running?
+sudo systemctl is-active k3s
+# Expected: active
+
+# (b) Does kubectl work and is the node Ready?
+sudo kubectl get nodes
+# Expected: STATUS = Ready
+
+# (c) Is the GPU advertised at capacity 4? (time-slicing already configured)
+sudo kubectl get node -o jsonpath='{.items[0].status.capacity.nvidia\.com/gpu}{"\n"}'
+# Expected: 4
+```
+
+| (a) is-active | (b) Ready | (c) GPU = 4 | Action |
+|---|---|---|---|
+| ✅ active | ✅ Ready | ✅ 4 | **Skip §1.1.** Jump to §1.2 (kubeconfig) and continue. K3s + device plugin are already set up. |
+| ✅ active | ✅ Ready | ❌ 1 or empty | K3s is fine but the device plugin is missing. **Do NOT reinstall K3s.** Just apply the plugin: <br>`sudo kubectl apply -f demo/02-gpu-workload/nvidia-device-plugin.yaml` |
+| ❌ inactive / missing | n/a | n/a | K3s is not installed (or broken). Proceed with the install command below. |
+
+If you see a value of `1` instead of `4` in (c), the time-slicing ConfigMap was not loaded — re-applying `nvidia-device-plugin.yaml` (which is committed in this repo with `replicas: 4`) will fix it without touching K3s.
+
+#### Step 1: install K3s (only if Step 0 told you to)
+
 **`[Workstation]`** — Basic install (no GPU):
 
 ```bash
@@ -51,7 +81,7 @@ curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
   --container-runtime-endpoint unix:///run/containerd/containerd.sock" sh -
 ```
 
-> Alternatively, run the helper script which also handles the NVIDIA device plugin:
+> Alternatively, run the helper script which also handles the NVIDIA device plugin in one go:
 > ```bash
 > bash demo/02-gpu-workload/setup-gpu-runtime.sh
 > ```
