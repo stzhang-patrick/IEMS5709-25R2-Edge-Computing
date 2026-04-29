@@ -659,34 +659,62 @@ sudo k3s crictl pull ghcr.io/open-webui/open-webui:main
 
 ### 4.4 Loading the Lab 2 image (`faster-whisper:fastapi`) into K3s
 
-This is the image you built in **Lab 2** (your own `Dockerfile` + `api.py` that exposes the `/v1/audio/transcriptions` endpoint on port 5092). It only exists where Lab 2 was built — moving it into K3s is a 3-step process.
+This is the image you built in **Lab 2** — your own `Dockerfile` + `api.py` that exposes `/health`, `/v1/models`, and `/v1/audio/transcriptions` on port 5092. Lab 4 reuses this image as-is. Moving it into K3s is a 3-step process (Steps 1–3 below); but first, make sure the image actually exists.
 
-#### Step 0: do you already have it in Docker?
+#### Step 0: does the image already exist on this machine?
 
 ```bash
 docker images | grep faster-whisper
 # REPOSITORY        TAG       ...   SIZE
-# faster-whisper    fastapi   ...   ~11 GB     <-- this is what you need
+# faster-whisper    fastapi   ...   1–7 GB     <-- this is what you need
 ```
 
-- **If yes** → skip to Step 1 (save).
-- **If no** → you have to (re)build it first. From your Lab 2 submission folder (whatever you submitted as your `Dockerfile` + `api.py`):
-  ```bash
-  cd /path/to/your-lab2-submission
-  docker build -t faster-whisper:fastapi .
-  ```
-  This rebuild is slow (often 30–60 min on Jetson because of CTranslate2 + CUDA dependencies). If the machine is shared and someone else already built it on this exact host, their image is fine — just check `docker images` and reuse it.
+There are three cases:
+
+**Case A — image is there.** Skip to Step 1; just reuse it. Lab 4 does not require you to rebuild every time.
+
+**Case B — image is gone but your Lab 2 source is still on the machine.** Rebuild it from your Lab 2 folder. You need exactly two files inside that folder:
+
+- `Dockerfile` — **the one you rewrote in Lab 2**, not the 460-byte placeholder shipped in `Lab2/faster-whisper/Dockerfile`. That placeholder is a fragment of the `jetson-containers` framework (`ARG BASE_IMAGE` with no default, references to `install.sh`/`build.sh` that depend on framework env vars). Running `docker build .` on it will fail with `BASE_IMAGE must not be empty`. Your own Dockerfile must:
+  - choose a real base image (e.g. `python:3.9-slim` for a CPU build, or a `dustynv/...-r36.4.0` image for GPU acceleration),
+  - install your runtime deps (`faster-whisper`, `fastapi` or `flask`, `uvicorn`, `ffmpeg`, …),
+  - `COPY api.py` into the image,
+  - `EXPOSE 5092` and set a `CMD` that starts your HTTP server.
+- `api.py` — the FastAPI/Flask server you wrote, listening on `0.0.0.0:5092`, implementing `/health`, `/v1/models`, `/v1/audio/transcriptions`.
+
+Then:
+
+```bash
+cd /path/to/your-lab2-submission           # the folder with your Dockerfile + api.py
+ls Dockerfile api.py                       # both must be present
+
+docker build -t faster-whisper:fastapi .   # tag exactly as faster-whisper:fastapi
+```
+
+Build time and image size depend on the base you picked:
+
+| Base image used in your Lab 2 Dockerfile | Build time | Final image size | Inference |
+|---|---|---|---|
+| `python:3.9-slim` (or similar) | ~2–3 min | ~1.2 GB | CPU only |
+| `dustynv/faster-whisper:r36.4.0-cu128-24.04` (or similar L4T base with CUDA pre-installed) | ~5–10 min | ~5–7 GB | GPU accelerated |
+| `nvcr.io/nvidia/l4t-...` + manual install | 30+ min | 5–7 GB | GPU accelerated |
+
+> Note: this **rebuilds** your image; it does **not** redo your Lab 2 work. If the rebuild fails, the problem is in your `Dockerfile` / `api.py`, not in Lab 4 — go back and finish Lab 2 first.
+
+**Case C — both the image and the source are gone.** Recover your Lab 2 work (re-clone your private repo, or re-download what you submitted to Blackboard), put it back somewhere on this machine, then follow Case B.
 
 #### Step 1: save the Docker image to a portable tarball
 
 ```bash
-docker save faster-whisper:fastapi -o /tmp/fw.tar    # ~4 min on Jetson, 11 GB
+docker save faster-whisper:fastapi -o /tmp/fw.tar
 ```
+
+Time and tarball size are roughly the same as the image size from Step 0 (~30 s for a 1 GB slim image, ~4 min for an 11 GB CUDA-accelerated image).
 
 #### Step 2: import the tarball into K3s's containerd (namespace `k8s.io`)
 
 ```bash
-sudo ctr -n k8s.io images import /tmp/fw.tar         # ~4 min unpack
+sudo ctr -n k8s.io images import /tmp/fw.tar         # unpack ≈ same as save time
 sudo rm /tmp/fw.tar                                  # tarball is root-owned
 ```
 
@@ -700,7 +728,7 @@ sudo kubectl get pod -l app=asr -w
 
 `STATUS=Running` and event `Container image "faster-whisper:fastapi" already present on machine` means it worked.
 
-> **Disk space**: Steps 1–2 briefly hold both the 11 GB tarball **and** an 11 GB unpacked copy in K3s's image store, so you need **about 25 GB free** on `/`. If your disk is over ~85% full, the kubelet may evict idle pods mid-import. Free space first with `docker image prune -a` to remove any old Lab 1/2/3 images you no longer need.
+> **Disk space**: Steps 1–2 briefly hold both the tarball **and** the unpacked copy in K3s's image store at the same time, so plan for **roughly 2× your image size in free space on `/`** (e.g. ~3 GB free for a 1 GB image, ~25 GB free for an 11 GB image). If your disk is over ~85% full, the kubelet may evict idle pods mid-import. Free space first with `docker image prune -a` to remove any old Lab 1/2/3 images you no longer need.
 
 ### 4.5 Common error: `ImagePullBackOff` after `kubectl apply`
 
