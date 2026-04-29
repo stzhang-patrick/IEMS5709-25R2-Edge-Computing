@@ -657,27 +657,50 @@ sudo k3s crictl pull docker.io/dustynv/kokoro-tts:fastapi-r36.4.0-cu128-24.04
 sudo k3s crictl pull ghcr.io/open-webui/open-webui:main
 ```
 
-### 4.4 Importing your Lab 2 image (`faster-whisper:fastapi`)
+### 4.4 Loading the Lab 2 image (`faster-whisper:fastapi`) into K3s
 
-Your Lab 2 ASR container exists only in Docker. Move it to K3s:
+This is the image you built in **Lab 2** (your own `Dockerfile` + `api.py` that exposes the `/v1/audio/transcriptions` endpoint on port 5092). It only exists where Lab 2 was built — moving it into K3s is a 3-step process.
+
+#### Step 0: do you already have it in Docker?
 
 ```bash
-# 1. Confirm Docker has it
 docker images | grep faster-whisper
-# faster-whisper   fastapi   ...   11GB
-
-# 2. Save it to a tarball
-docker save faster-whisper:fastapi -o /tmp/fw.tar     # ~3-5 min on Jetson
-
-# 3. Import it into K3s's containerd, k8s.io namespace
-sudo ctr -n k8s.io images import /tmp/fw.tar          # ~2-3 min unpack
-rm /tmp/fw.tar
-
-# 4. Verify K3s can see it
-sudo k3s crictl images | grep faster-whisper
+# REPOSITORY        TAG       ...   SIZE
+# faster-whisper    fastapi   ...   ~11 GB     <-- this is what you need
 ```
 
-> If you forgot to do Lab 2 or your `faster-whisper:fastapi` image was wiped, you need to (re)build it from `Lab2/faster-whisper/` first.
+- **If yes** → skip to Step 1 (save).
+- **If no** → you have to (re)build it first. From your Lab 2 submission folder (whatever you submitted as your `Dockerfile` + `api.py`):
+  ```bash
+  cd /path/to/your-lab2-submission
+  docker build -t faster-whisper:fastapi .
+  ```
+  This rebuild is slow (often 30–60 min on Jetson because of CTranslate2 + CUDA dependencies). If the machine is shared and someone else already built it on this exact host, their image is fine — just check `docker images` and reuse it.
+
+#### Step 1: save the Docker image to a portable tarball
+
+```bash
+docker save faster-whisper:fastapi -o /tmp/fw.tar    # ~4 min on Jetson, 11 GB
+```
+
+#### Step 2: import the tarball into K3s's containerd (namespace `k8s.io`)
+
+```bash
+sudo ctr -n k8s.io images import /tmp/fw.tar         # ~4 min unpack
+sudo rm /tmp/fw.tar                                  # tarball is root-owned
+```
+
+#### Step 3: verify and re-deploy
+
+```bash
+sudo k3s crictl images | grep faster-whisper
+sudo kubectl rollout restart deployment asr
+sudo kubectl get pod -l app=asr -w
+```
+
+`STATUS=Running` and event `Container image "faster-whisper:fastapi" already present on machine` means it worked.
+
+> **Disk space**: Steps 1–2 briefly hold both the 11 GB tarball **and** an 11 GB unpacked copy in K3s's image store, so you need **about 25 GB free** on `/`. If your disk is over ~85% full, the kubelet may evict idle pods mid-import. Free space first with `docker image prune -a` to remove any old Lab 1/2/3 images you no longer need.
 
 ### 4.5 Common error: `ImagePullBackOff` after `kubectl apply`
 
