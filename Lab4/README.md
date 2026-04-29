@@ -627,14 +627,14 @@ kubectl delete pod gpu-test
 
 ### 4.1 Why this is necessary
 
-K3s ships its **own** containerd, separate from the system Docker daemon. They use different image stores and namespaces:
+Docker and K3s keep their images in **two completely separate stores**:
 
-| Tool | Image store | Namespace |
+| Tool | Where images actually live | What lists them |
 |---|---|---|
-| `docker` | `/var/lib/docker/` | `moby` |
-| K3s (`crictl`, `kubectl`) | `/var/lib/rancher/k3s/agent/containerd/` | `k8s.io` |
+| `docker` | `/var/lib/docker/` (Docker's own image DB + overlay2) | `docker images` |
+| K3s | `/var/lib/containerd/` (OCI content store, namespace `k8s.io`) | `sudo k3s crictl images` <br>or `sudo ctr -n k8s.io images ls` |
 
-So an image you can see with `docker images` is **invisible** to K3s. You must move it across explicitly.
+`docker pull` stores images in Docker's private DB; `kubectl apply` reads from the containerd `k8s.io` namespace. They never sync automatically — even when both happen to be on the same machine and even when both ultimately run via the same containerd daemon. So an image visible to `docker images` is **invisible** to K3s. You must move it across explicitly with `docker save` (export to a portable OCI tarball) and `ctr -n k8s.io images import` (re-ingest into K3s's namespace).
 
 ### 4.2 Assignment images and where they come from
 
