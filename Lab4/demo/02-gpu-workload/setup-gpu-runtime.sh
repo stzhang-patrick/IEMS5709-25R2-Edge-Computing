@@ -36,17 +36,51 @@ fi
 if ! grep -q 'bin_dir = "/var/lib/rancher/k3s' /etc/containerd/config.toml 2>/dev/null; then
     echo "  Patching containerd CNI paths for K3s..."
     sudo python3 - <<'PYEOF'
+# Idempotent CNI block patcher.
+# Two cases on Jetson:
+#   1) Fresh JetPack: containerd config has no [..."cri".cni] block at all.
+#      ⇒ Insert ours after the [..."cri"] anchor.
+#   2) Pre-existing config (e.g. from earlier nvidia-ctk run, or distro default):
+#      already has a [..."cri".cni] block with default paths (e.g. /opt/cni/bin).
+#      ⇒ Strip the existing block FIRST so we don't end up with a duplicate
+#         table (containerd would refuse to load the file).
+import re
 p = '/etc/containerd/config.toml'
-with open(p) as f: s = f.read()
-anchor = '[plugins."io.containerd.grpc.v1.cri"]'
-block = '''
-    [plugins."io.containerd.grpc.v1.cri".cni]
-      bin_dir = "/var/lib/rancher/k3s/data/current/bin"
-      conf_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
-'''
-if anchor in s and '/var/lib/rancher/k3s' not in s:
-    s = s.replace(anchor, anchor + block, 1)
-    with open(p, 'w') as f: f.write(s)
+with open(p) as f: lines = f.readlines()
+
+cni_header = '[plugins."io.containerd.grpc.v1.cri".cni]'
+cri_anchor = '[plugins."io.containerd.grpc.v1.cri"]'
+
+# Pass 1: drop any existing cni block (header + body until next section / EOF).
+out, in_cni = [], False
+for line in lines:
+    s = line.lstrip()
+    if s.startswith(cni_header):
+        in_cni = True
+        continue
+    if in_cni:
+        # leave the block when we hit the next [section] (but not [[arrays]])
+        if s.startswith('[') and not s.startswith('[['):
+            in_cni = False
+        else:
+            continue
+    out.append(line)
+
+# Pass 2: insert our block right after [..."cri"] anchor.
+new, inserted = [], False
+for line in out:
+    new.append(line)
+    if not inserted and line.lstrip().startswith(cri_anchor) \
+       and not line.lstrip().startswith(cri_anchor + '.'):
+        new += [
+            '    [plugins."io.containerd.grpc.v1.cri".cni]\n',
+            '      bin_dir = "/var/lib/rancher/k3s/data/current/bin"\n',
+            '      conf_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"\n',
+        ]
+        inserted = True
+
+if inserted:
+    with open(p, 'w') as f: f.writelines(new)
 PYEOF
     NEED_CONTAINERD_RESTART=1
 else
