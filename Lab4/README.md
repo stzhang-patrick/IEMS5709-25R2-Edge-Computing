@@ -204,7 +204,8 @@ kubectl describe node
 #   pods:    110                ← max pods this node can schedule
 #
 # On Jetson Orin after the GPU device plugin is deployed, you will also see:
-#   nvidia.com/gpu: 1           ← GPU is available as a schedulable resource
+#   nvidia.com/gpu: 4           ← single iGPU exposed as 4 schedulable replicas
+#                                  via time-slicing (see Demo 2 / nvidia-device-plugin.yaml)
 ```
 
 **Inspect a pod** *(requires a running pod — revisit after Demo 1)*
@@ -232,16 +233,9 @@ kubectl delete pod <pod-name>     # delete a specific pod (a Deployment will rec
 
 **Namespaces**
 
-Kubernetes uses namespaces to isolate resources — like separate "projects" within one cluster.
+Kubernetes uses namespaces to isolate resources — like separate "projects" within one cluster. The four built-in ones are listed under the `kubectl get namespaces` output above. To create your own and switch into it:
 
 ```bash
-kubectl get namespaces
-# NAME              STATUS   AGE
-# default           Active   12h   ← your workloads go here unless you specify otherwise
-# kube-node-lease   Active   12h   ← internal: node heartbeat leases (ignore)
-# kube-public       Active   12h   ← unauthenticated public resources (rarely used)
-# kube-system       Active   12h   ← K3s system components live here
-
 kubectl create namespace lab4
 kubectl get pods -n lab4
 
@@ -593,8 +587,10 @@ kubectl -n kube-system rollout status daemonset/nvidia-device-plugin-daemonset
 ```bash
 # The node should now advertise GPUs as a schedulable resource
 kubectl describe node | grep -A10 "Capacity:"
-# Expected line: nvidia.com/gpu: 1
+# Expected line: nvidia.com/gpu: 4
 ```
+
+> **Why 4 and not 1?** Jetson has a single integrated GPU, but the assignment stack (`vllm` + `asr` + `tts`) needs three pods that each request `nvidia.com/gpu: 1`. The provided `nvidia-device-plugin.yaml` enables **time-slicing** with `replicas: 4`, telling the scheduler the GPU is "shareable up to 4 ways". Each pod still gets full GPU access at runtime — time-slicing is purely a scheduling primitive on Jetson where the iGPU already supports concurrent kernels. If you see `nvidia.com/gpu: 1`, the time-slicing ConfigMap was not applied — re-apply the plugin manifest.
 
 ### Step 3: Run a GPU test pod
 
@@ -608,12 +604,7 @@ If `nvidia-smi` output appears in the logs, GPU access is working end-to-end.
 
 ### Step 4: How is GPU access different from Docker Compose?
 
-| Docker Compose (Lab 3) | K3s (Lab 4) |
-|---|---|
-| `runtime: nvidia` | `resources.limits: {nvidia.com/gpu: 1}` |
-| `network_mode: host` | `hostNetwork: true` in pod spec |
-| `shm_size: "8g"` | `emptyDir: {medium: Memory, sizeLimit: 8Gi}` |
-| `ulimits: {memlock: -1}` | `securityContext` + capabilities |
+In short: instead of `runtime: nvidia` you declare `resources.limits: {nvidia.com/gpu: 1}` and the scheduler routes the pod to a node that has GPU capacity. See the full Compose-to-K3s mapping in the **Reference: Docker Compose → K3s Conversion** section at the bottom of this README.
 
 ```bash
 kubectl delete pod gpu-test
@@ -624,6 +615,8 @@ kubectl delete pod gpu-test
 ## Part 4: Loading Images into K3s (Required for the Assignment)
 
 > **Read this before applying the assignment YAMLs**, otherwise your pods will sit in `ImagePullBackOff` forever.
+>
+> **Prerequisite**: this part assumes Lab 2 is finished — i.e. you have rewritten the Lab 2 Dockerfile, written your own `api.py`, and successfully run `docker build -t faster-whisper:fastapi .`. If `docker images | grep faster-whisper` returns nothing on this machine, **finish Lab 2 first**; Lab 4's `asr` deployment cannot proceed without that image (or a public substitute, see §4.7 below).
 
 ### 4.1 Why this is necessary
 
@@ -632,7 +625,7 @@ Docker and K3s keep their images in **two completely separate stores**:
 | Tool | Where images actually live | What lists them |
 |---|---|---|
 | `docker` | `/var/lib/docker/` (Docker's own image DB + overlay2) | `docker images` |
-| K3s | `/var/lib/containerd/` (OCI content store, namespace `k8s.io`) | `sudo k3s crictl images` <br>or `sudo ctr -n k8s.io images ls` |
+| K3s | depends on the K3s install path (both use namespace `k8s.io`):<br>• `/var/lib/containerd/` — Jetson, when K3s was installed with `--container-runtime-endpoint unix:///run/containerd/containerd.sock` (i.e. the path in §1.1 above)<br>• `/var/lib/rancher/k3s/agent/containerd/` — Workstation default, when K3s runs its embedded containerd | `sudo k3s crictl images` <br>or `sudo ctr -n k8s.io images ls` |
 
 `docker pull` stores images in Docker's private DB; `kubectl apply` reads from the containerd `k8s.io` namespace. They never sync automatically — even when both happen to be on the same machine and even when both ultimately run via the same containerd daemon. So an image visible to `docker images` is **invisible** to K3s. You must move it across explicitly with `docker save` (export to a portable OCI tarball) and `ctr -n k8s.io images import` (re-ingest into K3s's namespace).
 
@@ -709,7 +702,7 @@ Build time and image size depend on the base you picked:
 docker save faster-whisper:fastapi -o /tmp/fw.tar
 ```
 
-Time and tarball size are roughly the same as the image size from Step 0 (~30 s for a 1 GB slim image, ~4 min for an 11 GB CUDA-accelerated image).
+Time and tarball size are roughly the same as the image size from Step 0 (~30 s for a 1 GB slim image, ~3 min for a 7 GB CUDA-accelerated image).
 
 #### Step 2: import the tarball into K3s's containerd (namespace `k8s.io`)
 
@@ -728,7 +721,7 @@ sudo kubectl get pod -l app=asr -w
 
 `STATUS=Running` and event `Container image "faster-whisper:fastapi" already present on machine` means it worked.
 
-> **Disk space**: Steps 1–2 briefly hold both the tarball **and** the unpacked copy in K3s's image store at the same time, so plan for **roughly 2× your image size in free space on `/`** (e.g. ~3 GB free for a 1 GB image, ~25 GB free for an 11 GB image). If your disk is over ~85% full, the kubelet may evict idle pods mid-import. Free space first with `docker image prune -a` to remove any old Lab 1/2/3 images you no longer need.
+> **Disk space**: Steps 1–2 briefly hold both the tarball **and** the unpacked copy in K3s's image store at the same time, so plan for **roughly 2× your image size in free space on `/`** (e.g. ~3 GB free for a 1 GB image, ~15 GB free for a 7 GB image). If your disk is over ~85% full, the kubelet may evict idle pods mid-import. Free space first with `docker image prune -a` to remove any old Lab 1/2/3 images you no longer need.
 
 ### 4.5 Common error: `ImagePullBackOff` after `kubectl apply`
 
@@ -747,16 +740,9 @@ Events:
                        require authorization
 ```
 
-This message is misleading. It does **not** mean a permissions issue — it means K3s tried to pull `faster-whisper:fastapi` from `docker.io` and didn't find it. The fix is §4.4 above.
+This message is misleading. It does **not** mean a permissions issue — it means K3s tried to pull `faster-whisper:fastapi` from `docker.io` and didn't find it. The fix is §4.4 above (after `ctr import`, the rollout restart there picks the image up).
 
-After importing, force the deployment to re-pull:
-
-```bash
-sudo kubectl rollout restart deployment asr
-sudo kubectl get pod -l app=asr -w
-```
-
-Setting `imagePullPolicy: IfNotPresent` in your YAML also helps — it tells K3s to skip the registry pull if the image is already in containerd.
+Tip: setting `imagePullPolicy: IfNotPresent` in your YAML also helps — it tells K3s to skip the registry pull if the image is already in containerd.
 
 ### 4.6 Quick sanity check before applying the assignment
 
@@ -765,6 +751,35 @@ sudo k3s crictl images | grep -E 'vllm|kokoro|faster-whisper|open-webui'
 ```
 
 You should see all four. If anything is missing, fix it before `kubectl apply`.
+
+### 4.7 Image selection caveats (common mis-picks for `asr`)
+
+If you don't want to use your own Lab 2 build (for instance, the build keeps failing and the deadline is close), you may be tempted to point the `asr` deployment at a public faster-whisper image. Two specific images cause confusing failures on Jetson:
+
+**❌ `lewangdev/faster-whisper:latest`** — this is an x86_64-only image. K3s will pull it successfully, then the container immediately exits with:
+
+```
+exec /opt/nvidia/nvidia_entrypoint.sh: exec format error
+```
+
+This is a CPU-architecture mismatch (amd64 binary on arm64 hardware), not a config issue. There is no Jetson-friendly arm64 variant of this tag. Pick a different image.
+
+**⚠️ `dustynv/faster-whisper:r36.4.0-cu128-24.04`** — this image is arm64 / Jetson-native (good), but its default `ENTRYPOINT` runs the upstream test scripts and then exits 0. Used as a server it will `Completed` -> restart -> `Completed` -> ... in a CrashLoopBackOff with hundreds of restarts and **exit code 0**. To use it as the `asr` server you must override the entrypoint and supply your own server, e.g. by mounting your `api.py` from a hostPath and adding to the deployment:
+
+```yaml
+command:
+- sh
+- -c
+- pip3 install fastapi uvicorn python-multipart && python3 /workspace/api.py
+volumeMounts:
+- {name: asr-api, mountPath: /workspace/api.py, subPath: api.py}
+volumes:
+- name: asr-api
+  hostPath:
+    path: /home/<your-user>/path/to/Lab2/faster-whisper
+```
+
+Either way, the cleanest path is the standard one in §4.4: build `faster-whisper:fastapi` from your Lab 2 source, `docker save` + `ctr import`, and reference `image: faster-whisper:fastapi` in `asr.yaml`.
 
 ---
 
@@ -833,5 +848,7 @@ spec:
   - port: 8880
     targetPort: 8880
 ```
+
+> **Note on `nvidia.com/gpu: 1` and time-slicing:** the line `limits: {nvidia.com/gpu: 1}` requests **one GPU slot** for this pod. With time-slicing enabled by `nvidia-device-plugin.yaml` (see Demo 2 / §Step 2), the Jetson's single iGPU advertises `nvidia.com/gpu: 4` of capacity, so up to four pods that each ask for `1` can run concurrently. They share the GPU at runtime — Jetson's iGPU supports concurrent kernels — and each pod still sees the full device.
 
 > **Note on `network_mode: host` and vLLM:** vLLM in Lab 3 used `network_mode: host` for performance. In K3s the equivalent is `hostNetwork: true` in the pod spec. However, when `hostNetwork: true` is set, other pods must reach vLLM via the node IP (e.g., `http://192.168.1.x:8000`) rather than via a ClusterIP Service DNS name. The assignment asks you to handle this trade-off explicitly.
