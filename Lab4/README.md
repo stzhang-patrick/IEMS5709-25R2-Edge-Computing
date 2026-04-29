@@ -616,7 +616,17 @@ kubectl delete pod gpu-test
 
 > **Read this before applying the assignment YAMLs**, otherwise your pods will sit in `ImagePullBackOff` forever.
 >
-> **Prerequisite**: this part assumes Lab 2 is finished — i.e. you have rewritten the Lab 2 Dockerfile, written your own `api.py`, and successfully run `docker build -t faster-whisper:fastapi .`. If `docker images | grep faster-whisper` returns nothing on this machine, **finish Lab 2 first**; Lab 4's `asr` deployment cannot proceed without that image (or a public substitute, see §4.7 below).
+> **Prerequisite 1 — Lab 2 is done**: this part assumes Lab 2 is finished — i.e. you have rewritten the Lab 2 Dockerfile, written your own `api.py`, and successfully run `docker build -t faster-whisper:fastapi .`. If `docker images | grep faster-whisper` returns nothing on this machine, **finish Lab 2 first**; Lab 4's `asr` deployment cannot proceed without that image (or a public substitute, see §4.7 below).
+>
+> **Prerequisite 2 — model weights are pre-staged**: vLLM in this assignment loads the **Qwen3-4B-quantized.w4a16** weights from a hostPath volume mounted at `/opt/models/`. The TA team has pre-deployed the following directories to every Jetson host:
+>
+> ```
+> /opt/models/Qwen3-4B-quantized.w4a16     ~3.3 GB  (used by vllm.yaml)
+> /opt/models/Qwen3-ASR-0.6B               ~1.8 GB  (reference, not used by Lab 4)
+> /opt/models/Qwen3-TTS-12Hz-0.6B-Base     ~2.4 GB  (reference, not used by Lab 4)
+> ```
+>
+> Verify with `ls /opt/models/`. If `Qwen3-4B-quantized.w4a16` is missing or empty, **stop and contact a TA**; do not try to download it yourself (HuggingFace gating + Jetson network restrictions will burn hours). vLLM will not start without these weights.
 
 ### 4.1 Why this is necessary
 
@@ -746,11 +756,19 @@ Tip: setting `imagePullPolicy: IfNotPresent` in your YAML also helps — it tell
 
 ### 4.6 Quick sanity check before applying the assignment
 
+Two things must be true on this machine before `kubectl apply`:
+
 ```bash
+# 1. all four images are loaded into K3s containerd
 sudo k3s crictl images | grep -E 'vllm|kokoro|faster-whisper|open-webui'
+# expected: 4 lines (vllm, kokoro-tts, faster-whisper, open-webui)
+
+# 2. vLLM model weights are present on the host (mounted via hostPath)
+ls /opt/models/Qwen3-4B-quantized.w4a16
+# expected: a non-empty directory containing config.json, *.safetensors, etc.
 ```
 
-You should see all four. If anything is missing, fix it before `kubectl apply`.
+If either check fails, fix it before `kubectl apply` — apply will succeed but the pods will hang/crash and you will spend hours diagnosing.
 
 ### 4.7 Image selection caveats (common mis-picks for `asr`)
 
@@ -780,6 +798,30 @@ volumes:
 ```
 
 Either way, the cleanest path is the standard one in §4.4: build `faster-whisper:fastapi` from your Lab 2 source, `docker save` + `ctr import`, and reference `image: faster-whisper:fastapi` in `asr.yaml`.
+
+### 4.8 Common error: `vllm` pod in `CrashLoopBackOff`
+
+`ImagePullBackOff` (§4.5) means K3s couldn't get the image. **`CrashLoopBackOff`** is different: the image was found, the container started, but the process inside died. For `vllm` on Jetson Orin NX (16 GB shared RAM/VRAM) the cause is almost always one of:
+
+```bash
+sudo kubectl get pod -l app=vllm
+# NAME             READY   STATUS             RESTARTS   AGE
+# vllm-xxxx-yyyy   0/1     CrashLoopBackOff   8 (1m ago) 25m
+
+# Read the logs from the last failed attempt — the live logs are usually empty.
+sudo kubectl logs -l app=vllm --previous --tail=80
+```
+
+Look for these markers in the previous-attempt logs:
+
+| What you see | What it means | Fix |
+|---|---|---|
+| `torch.cuda.OutOfMemoryError` <br>or `Killed` (the pod just disappears) <br>or `OOMKilled` in `kubectl describe pod` | The 4B quantized model + KV cache wouldn't fit alongside `asr` and `tts`. | Lower memory pressure: `--gpu-memory-utilization 0.40`, `--max-model-len 2048`, `--max-num-batched-tokens 1024`. Apply only one change at a time and re-deploy. |
+| `FileNotFoundError: ... config.json` <br>or `OSError: ... Qwen3-4B-quantized.w4a16` | The hostPath volume is empty / wrong path / model directory missing. | `ls /opt/models/Qwen3-4B-quantized.w4a16` must list `config.json`. If empty, ask a TA — see Prerequisite 2 at the top of Part 4. |
+| `address already in use: 0.0.0.0:8000` | Another process on this Jetson is already bound to port 8000 (e.g. an old `docker run` of vLLM, or a shared user's vLLM). `hostNetwork: true` means there is no port isolation. | `sudo ss -tlnp | grep 8000` to find the offender, kill it, then `kubectl rollout restart deployment vllm`. |
+| `RuntimeError: CUDA error: ...` <br>or hangs at "Loading model" for >5 min | First-load cuBLAS/cuDNN compilation is slow on Jetson — usually fine after one full restart. If it persists, try `kubectl delete pod -l app=vllm` once. | Wait. Allow up to 90 s for first model load. If it still hangs, restart the pod. |
+
+> **OOM is not just a vLLM problem.** All three GPU pods (`vllm` + `asr` + `tts`) share the same 16 GB iGPU pool. If you reduced `--gpu-memory-utilization` and vLLM still OOMs, check that `asr` and `tts` are actually idle — running speech inference on all three simultaneously can push the total over the limit.
 
 ---
 
